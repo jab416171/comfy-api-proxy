@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+early_access: false
+tone_instructions: |
+  This is a Python/aiohttp service (comfy-api-proxy). CI already runs
+  `ruff check`, `ruff format --check`, and `mypy` on every PR — do not repeat
+  their findings or nitpick style/formatting. Focus on correctness, security
+  (no hardcoded credentials or upstream URLs), async/await handling, and
+  error propagation between the proxy and its upstream. Only comment on
+  issues introduced by this PR's changes; do not flag pre-existing problems
+  in moved, re-indented, or reformatted code.
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  commit_status: true
+  collapse_walkthrough: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+
+  path_filters:
+    - "!**/__pycache__/**"
+    - "!**/*.pyc"
+    - "!**/*.egg-info/**"
+    - "!.venv/**"
+
+  path_instructions:
+    - path: "src/comfy_api_proxy/**"
+      instructions: |
+        Core proxy service code. Focus on:
+        - No hardcoded credentials, API keys, or upstream URLs
+        - Correct propagation of upstream/downstream HTTP errors and status codes
+        - Async/await correctness (no blocking calls inside aiohttp handlers)
+        - Sensible timeout and retry handling for outbound requests
+    - path: "demo/**"
+      instructions: |
+        Human-facing demo scripts, not production code. Keep feedback to
+        low-priority style guidance; do not require production-grade error
+        handling or test coverage here.
+    - path: "tests/**"
+      instructions: |
+        Verify tests exercise the described behavior rather than just
+        asserting current output (no change-detector tests).
+
+  tools:
+    ruff:
+      enabled: false
+    gitleaks:
+      enabled: true
+    github-checks:
+      enabled: true
+      timeout_ms: 90000
+    ast-grep:
+      essential_rules: true
+
+chat:
+  auto_reply: true

@@ -613,10 +613,9 @@ def test_model_asset_ref_resolves_to_root_relative_filename(stack_with_models_di
 # 422 mapping: reserved top-level fields and a missing 'workflow' key.
 #
 # test_reserved_fields_rejected (above) only exercises 'webhook_url'; submit()
-# rejects 'inputs' the same way (it isn't accepted until the not-yet-built
-# Idempotency-Key / replay path exists), and a request with no 'workflow' key
-# at all is a distinct code path from both the reserved-field check and the
-# UI-format-graph check.
+# rejects 'inputs' the same way (a reserved field, not accepted in v1), and a
+# request with no 'workflow' key at all is a distinct code path from both the
+# reserved-field check and the UI-format-graph check.
 # ---------------------------------------------------------------------------
 def test_submit_reserved_inputs_field_rejected(stack):
     status, body, raw = stack.request(
@@ -630,6 +629,109 @@ def test_submit_missing_workflow_key_rejected(stack):
     status, body, raw = stack.request("POST", "/api/v2/jobs", {})
     assert status == 422, raw
     assert body["error"]["code"] == "invalid_workflow"
+
+
+def test_idempotency_key_reuse_rejected(stack):
+    # Single-use, reject-on-duplicate (no replay): the first submit with a key
+    # succeeds; a second submit reusing the same key is 422 idempotency_key_reuse;
+    # a different key is accepted.
+    wf = {"workflow": {"1": {"class_type": "Noop", "inputs": {}}}}
+    s1, _, r1 = stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": "key-abc"})
+    assert s1 == 201, r1
+    s2, b2, r2 = stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": "key-abc"})
+    assert s2 == 422, r2
+    assert b2["error"]["code"] == "idempotency_key_reuse"
+    s3, _, r3 = stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": "key-xyz"})
+    assert s3 == 201, r3
+
+
+def test_idempotency_key_released_on_rejection_allows_retry(stack):
+    # A submit that ComfyUI DEFINITELY rejects (no job created) must release
+    # the key so a corrected retry with the SAME key can go through. An empty
+    # graph makes the fake ComfyUI return 400 -> the proxy maps it to 422
+    # invalid_workflow and releases the key.
+    bad = {"workflow": {}}
+    s1, b1, r1 = stack.request("POST", "/api/v2/jobs", bad, headers={"Idempotency-Key": "rel-1"})
+    assert s1 == 422, r1
+    assert b1["error"]["code"] == "invalid_workflow"
+    good = {"workflow": {"1": {"class_type": "Noop", "inputs": {}}}}
+    s2, _, r2 = stack.request("POST", "/api/v2/jobs", good, headers={"Idempotency-Key": "rel-1"})
+    assert s2 == 201, r2  # key was released by the rejection, retry allowed
+
+
+def test_idempotency_key_not_consumed_by_earlier_validation(stack):
+    # Validation that runs BEFORE the key is claimed (UI-format detection here)
+    # must not consume the key: a corrected retry with the same key succeeds.
+    ui = {"workflow": {"nodes": [], "links": []}}
+    s1, b1, r1 = stack.request("POST", "/api/v2/jobs", ui, headers={"Idempotency-Key": "val-1"})
+    assert s1 == 422, r1
+    assert b1["error"]["code"] == "workflow_format_ui"
+    good = {"workflow": {"1": {"class_type": "Noop", "inputs": {}}}}
+    s2, _, r2 = stack.request("POST", "/api/v2/jobs", good, headers={"Idempotency-Key": "val-1"})
+    assert s2 == 201, r2
+
+
+def test_idempotency_key_empty_header_rejected(stack):
+    # A present-but-empty Idempotency-Key is malformed input (400), not "no key"
+    # (which would silently bypass enforcement).
+    wf = {"workflow": {"1": {"class_type": "Noop", "inputs": {}}}}
+    s, b, r = stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": ""})
+    assert s == 400, r
+    assert b["error"]["code"] == "invalid_request"
+    # An over-long key is likewise rejected before it can be stored.
+    s2, b2, r2 = stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": "x" * 256})
+    assert s2 == 400, r2
+    assert b2["error"]["code"] == "invalid_request"
+
+
+def test_idempotency_key_concurrent_same_key_one_wins(stack):
+    # Two genuinely concurrent submits with the same key: exactly one is
+    # accepted (201) and the other is rejected (422). This is the property the
+    # synchronous check-then-claim (no await between test and add) guarantees.
+    import concurrent.futures
+
+    wf = {"workflow": {"1": {"class_type": "Noop", "inputs": {"hang": True}}}}
+
+    def submit():
+        return stack.request("POST", "/api/v2/jobs", wf, headers={"Idempotency-Key": "conc-1"})[0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        statuses = sorted(f.result() for f in [ex.submit(submit), ex.submit(submit)])
+    assert statuses == [201, 422], statuses
+
+
+async def test_idempotency_key_held_when_upstream_unreachable():
+    # An ambiguous outcome (ComfyUI unreachable) HOLDS the key: ComfyUI may
+    # already hold the prompt, so a same-key retry must not double-submit. The
+    # first submit is 503; a retry with the same key is 422 idempotency_key_reuse.
+    from aiohttp.test_utils import make_mocked_request
+
+    from comfy_api_proxy.app import Proxy
+
+    def _submit_req(key):
+        req = make_mocked_request(
+            "POST",
+            "/api/v2/jobs",
+            headers={"Content-Type": "application/json", "Idempotency-Key": key},
+        )
+
+        async def _json():
+            return {"workflow": {"1": {"class_type": "Noop", "inputs": {}}}}
+
+        req.json = _json
+        return req
+
+    proxy = Proxy("http://127.0.0.1:1")  # port 1 -> connection refused
+    await proxy.on_startup(None)
+    try:
+        first = await proxy.submit(_submit_req("hold-1"))
+        assert first.status == 503
+        assert json.loads(first.body)["error"]["code"] == "upstream_unreachable"
+        second = await proxy.submit(_submit_req("hold-1"))
+        assert second.status == 422
+        assert json.loads(second.body)["error"]["code"] == "idempotency_key_reuse"
+    finally:
+        await proxy.on_cleanup(None)
 
 
 # ---------------------------------------------------------------------------

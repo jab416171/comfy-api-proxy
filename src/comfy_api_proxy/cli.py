@@ -100,6 +100,13 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         "exposes an unauthenticated proxy to the network.",
     )
     parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="Directory for proxy-layer SQLite state (jobs, idempotency keys, "
+        "asset index, signing secret). Opt-in; not ComfyUI's asset DB — "
+        "see docs/batch-workloads.md.",
+    )
+    parser.add_argument(
         "--enable-cors-header",
         action="append",
         default=[],
@@ -153,6 +160,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
         args.comfyui,
         comfyui_base_dir=args.comfyui_base_dir,
         max_upload_bytes=args.max_upload_mb * 1024 * 1024,
+        state_dir=args.state_dir,
         middlewares=middlewares,
     )
     if cors_origins:
@@ -179,6 +187,8 @@ def _server_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--comfyui-base-dir", args.comfyui_base_dir]
     if args.allow_insecure_bind:
         argv += ["--allow-insecure-bind"]
+    if args.state_dir:
+        argv += ["--state-dir", args.state_dir]
     for origin in args.cors_origins:
         argv += ["--enable-cors-header", origin]
     return argv

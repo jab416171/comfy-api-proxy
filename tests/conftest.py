@@ -174,11 +174,17 @@ def _make_stack(
     comfyui_base_dir: str | None = None,
     token: str | None = None,
     max_upload_mb: int | None = None,
+    state_dir: str | None = None,
+    comfyui_port: int | None = None,
     cors_origins: list[str] | None = None,
 ):
-    """Spawn fake ComfyUI + the real proxy on free ports; yield a Stack driver."""
+    """Spawn fake ComfyUI + the real proxy on free ports; yield a Stack driver.
+
+    Pass ``comfyui_port`` to reuse an already-running fake (the ``fake_comfyui``
+    fixture) so a test can restart the proxy alone, leaving upstream history
+    intact — the state a proxy restart in production actually meets.
+    """
     procs: list[tuple[subprocess.Popen, str, Path]] = []
-    comfyui_port = _free_port()
     proxy_port = _free_port()
 
     def _spawn(args: list[str], port: int, label: str) -> None:
@@ -188,16 +194,18 @@ def _make_stack(
         procs.append((proc, label, log_path))
         _wait_for_port(port, proc, label, log_path)
 
-    _spawn(
-        [
-            sys.executable,
-            str(REPO_ROOT / "demo" / "fake_comfyui.py"),
-            "--port",
-            str(comfyui_port),
-        ],
-        comfyui_port,
-        "fake_comfyui",
-    )
+    if comfyui_port is None:
+        comfyui_port = _free_port()
+        _spawn(
+            [
+                sys.executable,
+                str(REPO_ROOT / "demo" / "fake_comfyui.py"),
+                "--port",
+                str(comfyui_port),
+            ],
+            comfyui_port,
+            "fake_comfyui",
+        )
     proxy_args = [
         sys.executable,
         "-m",
@@ -213,6 +221,8 @@ def _make_stack(
         proxy_args += ["--token", token]
     if max_upload_mb is not None:
         proxy_args += ["--max-upload-mb", str(max_upload_mb)]
+    if state_dir is not None:
+        proxy_args += ["--state-dir", state_dir]
     for origin in cors_origins or []:
         proxy_args += ["--enable-cors-header", origin]
     _spawn(proxy_args, proxy_port, "proxy")
@@ -230,6 +240,37 @@ def _make_stack(
                 proc.wait(timeout=5)
 
     return stack, _cleanup
+
+
+@pytest.fixture
+def make_stack():
+    """Factory for Stack drivers with custom kwargs (e.g. state_dir restarts)."""
+    return _make_stack
+
+
+@pytest.fixture
+def fake_comfyui(tmp_path) -> Any:
+    """A fake ComfyUI whose lifetime is independent of any proxy; yields its
+    port for `make_stack(..., comfyui_port=...)`."""
+    port = _free_port()
+    log_path = tmp_path / "fake_comfyui_shared.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [sys.executable, str(REPO_ROOT / "demo" / "fake_comfyui.py"), "--port", str(port)],
+            cwd=REPO_ROOT,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+    _wait_for_port(port, proc, "fake_comfyui_shared", log_path)
+    try:
+        yield port
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 @pytest.fixture

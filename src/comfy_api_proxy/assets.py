@@ -132,3 +132,10 @@ class AssetStore:
         if self._persist is not None:
             self._persist.upsert_asset(record)
         return record
+
+    def delete(self, asset_id: str) -> bool:
+        """Delete an asset by id. Returns True if it existed."""
+        record = self._by_id.pop(asset_id, None)
+        if record is not None and self._persist is not None:
+            self._persist.delete_asset(asset_id)
+        return record is not None

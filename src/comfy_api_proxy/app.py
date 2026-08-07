@@ -1302,7 +1302,14 @@ class Proxy:
         record = self.assets.get(asset_id)
         if record is None:
             return _error(404, "not_found", "Unknown asset id.")
-        self.assets.delete(asset_id)
+
+        # Persist deletion to SQLite via asyncio.to_thread (serialized through
+        # AssetStore), then update in-memory state on the event-loop thread.
+        def _sync_persist_delete() -> None:
+            self.assets.persist_delete(asset_id)
+
+        await asyncio.to_thread(_sync_persist_delete)
+        self.assets.remove_in_memory(asset_id)
         return web.Response(status=204)
 
     def _asset_json(

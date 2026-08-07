@@ -135,7 +135,31 @@ class AssetStore:
 
     def delete(self, asset_id: str) -> bool:
         """Delete an asset by id. Returns True if it existed."""
-        record = self._by_id.pop(asset_id, None)
-        if record is not None and self._persist is not None:
+        record = self._by_id.get(asset_id)
+        if record is None:
+            return False
+        if self._persist is not None:
             self._persist.delete_asset(asset_id)
-        return record is not None
+        self._by_id.pop(asset_id, None)
+        if record.hash and self._id_by_hash.get(record.hash) == asset_id:
+            self._id_by_hash.pop(record.hash, None)
+        return True
+
+    def persist_delete(self, asset_id: str) -> bool:
+        """Delete from SQLite only (thread-safe, serialized through AssetStore).
+
+        Returns True if the asset existed.  In-memory state is NOT updated —
+        callers must do that on the event-loop thread after this completes.
+        """
+        record = self._by_id.get(asset_id)
+        if record is None:
+            return False
+        if self._persist is not None:
+            self._persist.delete_asset(asset_id)
+        return True
+
+    def remove_in_memory(self, asset_id: str) -> None:
+        """Remove an asset from the in-memory index (call on event-loop thread)."""
+        record = self._by_id.pop(asset_id, None)
+        if record is not None and record.hash:
+            self._id_by_hash.pop(record.hash, None)

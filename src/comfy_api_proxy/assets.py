@@ -161,5 +161,9 @@ class AssetStore:
     def remove_in_memory(self, asset_id: str) -> None:
         """Remove an asset from the in-memory index (call on event-loop thread)."""
         record = self._by_id.pop(asset_id, None)
-        if record is not None and record.hash:
+        if (
+            record is not None
+            and record.hash
+            and self._id_by_hash.get(record.hash) == asset_id
+        ):
             self._id_by_hash.pop(record.hash, None)

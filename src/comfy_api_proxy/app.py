@@ -1308,7 +1308,16 @@ class Proxy:
         def _sync_persist_delete() -> None:
             self.assets.persist_delete(asset_id)
 
-        await asyncio.to_thread(_sync_persist_delete)
+        persist_task = asyncio.create_task(asyncio.to_thread(_sync_persist_delete))
+        try:
+            await asyncio.shield(persist_task)
+        except asyncio.CancelledError:
+            # Cancellation (e.g. client disconnect): let the SQLite deletion
+            # finish, drop in-memory state only after persistence succeeds,
+            # then propagate the cancellation.
+            await persist_task
+            self.assets.remove_in_memory(asset_id)
+            raise
         self.assets.remove_in_memory(asset_id)
         return web.Response(status=204)
 

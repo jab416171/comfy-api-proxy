@@ -275,3 +275,9 @@ class StateStore:
             )
         id_by_hash = {str(r["hash"]): str(r["asset_id"]) for r in hash_rows}
         return by_id, id_by_hash
+
+    def delete_asset(self, asset_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
+            self._conn.execute("DELETE FROM asset_hash_index WHERE asset_id = ?", (asset_id,))
+            self._conn.commit()

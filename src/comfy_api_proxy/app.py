@@ -1164,6 +1164,10 @@ class Proxy:
                 resp = await r.json()
         except Exception:
             return None, _error(500, "upstream_error", "Failed to reach ComfyUI for upload.")
+        comfy_asset_id = None
+        asset_info = resp.get("asset")
+        if isinstance(asset_info, dict) and asset_info.get("id"):
+            comfy_asset_id = asset_info["id"]
         record = self.assets.add(
             hash_=hash_,
             size_bytes=size,
@@ -1175,6 +1179,7 @@ class Proxy:
                 "type": resp.get("type", "input"),
             },
             tags=tags,
+            asset_id=comfy_asset_id,
         )
         return record, None
 
@@ -1291,6 +1296,30 @@ class Proxy:
         upstream.release()
         await out.write_eof()
         return out
+
+    async def delete_asset(self, request: web.Request) -> web.Response:
+        asset_id = request.match_info["id"]
+        record = self.assets.get(asset_id)
+        if record is None:
+            return _error(404, "not_found", "Unknown asset id.")
+
+        # Persist deletion to SQLite via asyncio.to_thread (serialized through
+        # AssetStore), then update in-memory state on the event-loop thread.
+        def _sync_persist_delete() -> None:
+            self.assets.persist_delete(asset_id)
+
+        persist_task = asyncio.create_task(asyncio.to_thread(_sync_persist_delete))
+        try:
+            await asyncio.shield(persist_task)
+        except asyncio.CancelledError:
+            # Cancellation (e.g. client disconnect): let the SQLite deletion
+            # finish, drop in-memory state only after persistence succeeds,
+            # then propagate the cancellation.
+            await persist_task
+            self.assets.remove_in_memory(asset_id)
+            raise
+        self.assets.remove_in_memory(asset_id)
+        return web.Response(status=204)
 
     def _asset_json(
         self, record: AssetRecord, *, created_new: bool | None, base: str
@@ -1469,6 +1498,7 @@ def make_app(
             web.head("/api/v2/assets/by-hash/{hash}", proxy.head_asset_by_hash),
             web.get("/api/v2/assets/{id}", proxy.get_asset),
             web.get("/api/v2/assets/{id}/content", proxy.get_asset_content),
+            web.delete("/api/v2/assets/{id}", proxy.delete_asset),
         ]
     )
     return app

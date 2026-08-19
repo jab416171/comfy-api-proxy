@@ -171,6 +171,17 @@ class StateStore:
             ).fetchone()
         return None if row is None else _job_record(row)
 
+    def get_job_workflow(self, job_id: str) -> dict[str, Any] | None:
+        """The resolved (executed) workflow graph for one job, or None. Separate from
+        ``get_job`` (which deliberately skips this column) so the common
+        job-lookup path stays cheap; only GET /jobs/{id}/workflow pays for it."""
+        with self._lock:
+            row = self._conn.execute("SELECT workflow FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        workflow = json.loads(row["workflow"])
+        return workflow if isinstance(workflow, dict) else None
+
     # -- idempotency ---------------------------------------------------------
     def claim_idempotency(self, key: str, *, claimed_at: str, job_id: str | None = None) -> bool:
         """Return True if the key was newly claimed; False if already present."""
@@ -264,3 +275,9 @@ class StateStore:
             )
         id_by_hash = {str(r["hash"]): str(r["asset_id"]) for r in hash_rows}
         return by_id, id_by_hash
+
+    def delete_asset(self, asset_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
+            self._conn.execute("DELETE FROM asset_hash_index WHERE asset_id = ?", (asset_id,))
+            self._conn.commit()

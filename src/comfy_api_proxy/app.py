@@ -5,6 +5,10 @@ What each v2 operation maps to on ComfyUI:
 
   * ``POST /api/v2/jobs``        → resolve ``core/ASSET`` refs, then ``POST /prompt``
   * ``GET  /api/v2/jobs/{id}``   → ``/history/{id}`` (+ ``/queue`` for queued/running)
+  * ``GET  /api/v2/jobs/{id}/workflow`` → the proxy's own record of the
+                                   resolved (executed) graph, always
+                                   ``format: "api"`` (not ComfyUI's /history —
+                                   see ``_job_workflow``)
   * ``POST /api/v2/jobs/{id}/cancel`` → ``POST /api/jobs/{id}/cancel`` (atomic)
   * ``GET  /api/v2/jobs/{id}/events``  → live ``/ws`` translated to SSE
   * ``POST /api/v2/assets``      → ``POST /upload/image`` (inputs) or direct
@@ -400,6 +404,7 @@ class Proxy:
                             "hash": None,
                             "url": f"{base}/api/v2/assets/{aid}/content",
                             "url_expires_at": _iso(now + _RETENTION),
+                            "job_id": job_id,
                         }
                     )
         return out
@@ -439,6 +444,32 @@ class Proxy:
 
     def _knows_job(self, job_id: str) -> bool:
         return bool(self._job_meta(job_id))
+
+    def _job_workflow(self, job_id: str) -> dict[str, Any] | None:
+        """The API-format graph ``job_id`` actually ran with (core/ASSET refs
+        already resolved to filenames — see ``resolved_workflow`` in
+        ``submit``), or None if this proxy can no longer produce it (never
+        seen, evicted from the in-memory window, or --state-dir isn't in
+        use).
+
+        Deliberately NOT read from ComfyUI's own /history: even though it
+        holds the same resolved graph, it carries this proxy's own
+        extra_data (partner API key) alongside it, which our own record
+        never does — reading from history would risk leaking that credential.
+
+        A record reloaded into memory by ``_load_state`` (via ``store.load_jobs``)
+        has no "workflow" key at all — that startup path deliberately skips
+        hydrating it (see ``StateStore.load_jobs``) — so its presence, not
+        just the meta dict's presence, decides whether to trust memory or
+        fall through to the store's dedicated column read.
+        """
+        meta = self._jobs.get(job_id)
+        if meta is not None and "workflow" in meta:
+            workflow = meta["workflow"]
+            return workflow if isinstance(workflow, dict) else None
+        if self._store is not None:
+            return self._store.get_job_workflow(job_id)
+        return None
 
     def _job(self, job_id: str, state: dict[str, Any], base: str) -> dict[str, Any]:
         meta = self._job_meta(job_id)
@@ -746,7 +777,10 @@ class Proxy:
             # Unknown outcome — ComfyUI may already hold the prompt. HOLD the
             # key (do not release) so a same-key retry can't double-submit.
             return _error(503, "upstream_unreachable", "Could not reach ComfyUI to submit the job.")
-        self._remember_job(job_id, workflow=workflow, metadata=metadata, priority=priority)
+        # Store the RESOLVED graph (core/ASSET refs replaced with filenames) —
+        # what actually ran, matching GET /jobs/{id}/workflow's contract and
+        # Cloud's own behavior — not the as-submitted `workflow`.
+        self._remember_job(job_id, workflow=resolved_workflow, metadata=metadata, priority=priority)
         base = _external_base(request)
         return web.json_response(
             self._job(job_id, {"status": "queued", "outputs": [], "outputs_reused": False}, base),
@@ -825,6 +859,20 @@ class Proxy:
         if state["status"] == "unknown" and not self._knows_job(job_id):
             return _error(404, "not_found", f"No job {job_id}.")
         return web.json_response(self._job(job_id, state, base))
+
+    async def get_job_workflow(self, request: web.Request) -> web.Response:
+        job_id = request.match_info["id"]
+        if not _valid_job_id(job_id):
+            return _error(404, "not_found", f"No job {job_id}.")
+        workflow = self._job_workflow(job_id)
+        if workflow is None:
+            return _error(404, "not_found", f"No recoverable workflow for job {job_id}.")
+        # `format` discriminates save-format (authoring) vs. api-format
+        # (executed) graphs — Cloud can return either depending on whether a
+        # job pins a workflow version; this proxy has no version concept and
+        # always returns the executed graph, but sets the field regardless so
+        # a client sees the same response shape against either backend.
+        return web.json_response({"workflow": workflow, "format": "api"})
 
     async def cancel_job(self, request: web.Request) -> web.Response:
         job_id = request.match_info["id"]
@@ -1117,6 +1165,10 @@ class Proxy:
                 resp = await r.json()
         except Exception:
             return None, _error(500, "upstream_error", "Failed to reach ComfyUI for upload.")
+        comfy_asset_id = None
+        asset_info = resp.get("asset")
+        if isinstance(asset_info, dict) and asset_info.get("id"):
+            comfy_asset_id = asset_info["id"]
         record = self.assets.add(
             hash_=hash_,
             size_bytes=size,
@@ -1128,6 +1180,7 @@ class Proxy:
                 "type": resp.get("type", "input"),
             },
             tags=tags,
+            asset_id=comfy_asset_id,
         )
         return record, None
 
@@ -1164,18 +1217,21 @@ class Proxy:
         if decoded is not None:
             now = _now()
             ctype = mimetypes.guess_type(decoded["f"])[0] or "application/octet-stream"
-            return web.json_response(
-                {
-                    "id": asset_id,
-                    "hash": None,
-                    "size_bytes": 0,
-                    "content_type": ctype,
-                    "file_path": decoded["f"],
-                    "created_at": _iso(now),
-                    "url": f"{base}/api/v2/assets/{asset_id}/content",
-                    "url_expires_at": _iso(now + _RETENTION),
-                }
-            )
+            body: dict[str, Any] = {
+                "id": asset_id,
+                "hash": None,
+                "size_bytes": 0,
+                "content_type": ctype,
+                "file_path": decoded["f"],
+                "created_at": _iso(now),
+                "url": f"{base}/api/v2/assets/{asset_id}/content",
+                "url_expires_at": _iso(now + _RETENTION),
+            }
+            # "j" is absent on ids minted before per-job-scoping (see
+            # _decode_asset_id) — omit rather than fabricate a job_id for those.
+            if "j" in decoded:
+                body["job_id"] = decoded["j"]
+            return web.json_response(body)
         return _error(404, "not_found", "Unknown asset id.")
 
     async def get_asset_content(self, request: web.Request) -> web.StreamResponse:
@@ -1241,6 +1297,30 @@ class Proxy:
         upstream.release()
         await out.write_eof()
         return out
+
+    async def delete_asset(self, request: web.Request) -> web.Response:
+        asset_id = request.match_info["id"]
+        record = self.assets.get(asset_id)
+        if record is None:
+            return _error(404, "not_found", "Unknown asset id.")
+
+        # Persist deletion to SQLite via asyncio.to_thread (serialized through
+        # AssetStore), then update in-memory state on the event-loop thread.
+        def _sync_persist_delete() -> None:
+            self.assets.persist_delete(asset_id)
+
+        persist_task = asyncio.create_task(asyncio.to_thread(_sync_persist_delete))
+        try:
+            await asyncio.shield(persist_task)
+        except asyncio.CancelledError:
+            # Cancellation (e.g. client disconnect): let the SQLite deletion
+            # finish, drop in-memory state only after persistence succeeds,
+            # then propagate the cancellation.
+            await persist_task
+            self.assets.remove_in_memory(asset_id)
+            raise
+        self.assets.remove_in_memory(asset_id)
+        return web.Response(status=204)
 
     def _asset_json(
         self, record: AssetRecord, *, created_new: bool | None, base: str
@@ -1409,6 +1489,7 @@ def make_app(
             web.post("/api/v2/jobs", proxy.submit),
             web.get("/api/v2/jobs", proxy.list_jobs),
             web.get("/api/v2/jobs/{id}", proxy.get_job),
+            web.get("/api/v2/jobs/{id}/workflow", proxy.get_job_workflow),
             web.post("/api/v2/jobs/{id}/cancel", proxy.cancel_job),
             web.get("/api/v2/jobs/{id}/events", proxy.job_events),
             # assets
@@ -1418,6 +1499,7 @@ def make_app(
             web.head("/api/v2/assets/by-hash/{hash}", proxy.head_asset_by_hash),
             web.get("/api/v2/assets/{id}", proxy.get_asset),
             web.get("/api/v2/assets/{id}/content", proxy.get_asset_content),
+            web.delete("/api/v2/assets/{id}", proxy.delete_asset),
         ]
     )
     return app
